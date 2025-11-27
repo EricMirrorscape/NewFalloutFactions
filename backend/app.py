@@ -6,7 +6,7 @@ from typing import List, Dict, Optional
 
 import faiss
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -15,20 +15,17 @@ from pydantic import BaseModel
 import httpx
 
 # ============================================================
-#  OPENAI KEY (from Railway environment variable)
+#  FASTAPI SETUP (do this FIRST, before any env checks)
 # ============================================================
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY not set. Add it in Railway Variables.")
+app = FastAPI(title="Rules Assistant", version="1.0")
 
-def get_openai():
-    http_client = httpx.Client(
-        timeout=60.0,
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=40)
-    )
-    return OpenAI(api_key=openai_api_key, http_client=http_client)
-
-client = get_openai()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ============================================================
 #  DATA PATHS (Railway structure)
@@ -41,18 +38,58 @@ DB_PATH = DATA_DIR / "chunks.db"
 INDEX_PATH = DATA_DIR / "rulebook.index"
 SYSTEM_PROMPT_PATH = Path(__file__).parent / "system_prompt.txt"
 
-# Load FAISS index
-index = faiss.read_index(str(INDEX_PATH))
+# ============================================================
+#  LAZY INITIALIZATION (defer until first request)
+# ============================================================
+_client = None
+_index = None
+_conn = None
+_system_prompt = None
 
-# Connect to SQLite
-conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-conn.row_factory = sqlite3.Row
+def get_openai_client():
+    """Lazy load OpenAI client - checks env var at request time, not import time"""
+    global _client
+    if _client is None:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise HTTPException(
+                status_code=500, 
+                detail="OPENAI_API_KEY not configured. Add it in Railway Variables tab."
+            )
+        http_client = httpx.Client(
+            timeout=60.0,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=40)
+        )
+        _client = OpenAI(api_key=api_key, http_client=http_client)
+    return _client
 
-# Load system prompt (or use default)
-if SYSTEM_PROMPT_PATH.exists():
-    SYSTEM_PROMPT = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
-else:
-    SYSTEM_PROMPT = """You are an expert rules assistant for a tabletop game.
+def get_index():
+    """Lazy load FAISS index"""
+    global _index
+    if _index is None:
+        if not INDEX_PATH.exists():
+            raise HTTPException(status_code=500, detail=f"Index not found: {INDEX_PATH}")
+        _index = faiss.read_index(str(INDEX_PATH))
+    return _index
+
+def get_db_conn():
+    """Lazy load SQLite connection"""
+    global _conn
+    if _conn is None:
+        if not DB_PATH.exists():
+            raise HTTPException(status_code=500, detail=f"Database not found: {DB_PATH}")
+        _conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        _conn.row_factory = sqlite3.Row
+    return _conn
+
+def get_system_prompt():
+    """Lazy load system prompt"""
+    global _system_prompt
+    if _system_prompt is None:
+        if SYSTEM_PROMPT_PATH.exists():
+            _system_prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
+        else:
+            _system_prompt = """You are an expert rules assistant for a tabletop game.
 You must answer ONLY using the provided rulebook excerpts.
 
 Format:
@@ -63,24 +100,12 @@ REASONING: [Detailed explanation with citations]
 If the excerpts don't contain the answer:
 SHORT ANSWER: No explicit rule found.
 REASONING: The rulebook sections provided do not cover this specific situation."""
+    return _system_prompt
 
 # ============================================================
 #  SESSION MEMORY
 # ============================================================
 last_questions = {}
-
-# ============================================================
-#  FASTAPI SETUP
-# ============================================================
-app = FastAPI(title="Rules Assistant", version="1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ============================================================
 #  DATA MODELS
@@ -102,11 +127,13 @@ class ChatResponse(BaseModel):
 #  HELPER FUNCTIONS
 # ============================================================
 def embed(text: str) -> np.ndarray:
+    client = get_openai_client()
     resp = client.embeddings.create(model="text-embedding-3-small", input=text)
     return np.array(resp.data[0].embedding, dtype="float32")
 
 def rewrite_query(user_message: str, session_id: Optional[str]) -> str:
     """Rewrite casual questions into rulebook search terms."""
+    client = get_openai_client()
     text = user_message.strip()
     is_short = (
         len(text.split()) <= 6
@@ -133,6 +160,7 @@ def rewrite_query(user_message: str, session_id: Optional[str]) -> str:
 
 def fetch_chunks(indices: List[int]) -> List[Dict]:
     """Fetch chunks from SQLite by FAISS indices."""
+    conn = get_db_conn()
     chunk_data = []
     for faiss_idx in indices:
         sqlite_id = faiss_idx + 1  # FAISS 0-indexed, SQLite 1-indexed
@@ -142,10 +170,11 @@ def fetch_chunks(indices: List[int]) -> List[Dict]:
     return chunk_data
 
 def generate_answer(question: str, rewritten: str, chunks: List[Dict]) -> str:
+    client = get_openai_client()
     combined_text = "\n\n".join(f"[p{c['page']}] {c['content']}" for c in chunks)
     
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": get_system_prompt()},
         {
             "role": "user",
             "content": f"QUESTION: {question}\nSEARCH TERMS: {rewritten}\n\nRULEBOOK EXCERPTS:\n{combined_text}"
@@ -166,6 +195,9 @@ def generate_answer(question: str, rewritten: str, chunks: List[Dict]) -> str:
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
+    
+    # Get index (lazy loaded)
+    index = get_index()
     
     # Rewrite query
     rewritten = rewrite_query(req.message, session_id)
@@ -202,11 +234,53 @@ async def chat(req: ChatRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "chunks": index.ntotal}
+    """Health check - also verifies configuration"""
+    status = {"status": "healthy"}
+    
+    # Check if API key is set (without revealing it)
+    if os.getenv("OPENAI_API_KEY"):
+        status["openai"] = "configured"
+    else:
+        status["openai"] = "NOT CONFIGURED - add OPENAI_API_KEY in Railway Variables"
+        status["status"] = "degraded"
+    
+    # Check data files
+    status["index_exists"] = INDEX_PATH.exists()
+    status["db_exists"] = DB_PATH.exists()
+    status["frontend_exists"] = FRONTEND_DIR.exists()
+    
+    # Show paths for debugging
+    status["paths"] = {
+        "base": str(BASE_DIR),
+        "data": str(DATA_DIR),
+        "frontend": str(FRONTEND_DIR)
+    }
+    
+    return status
+
+@app.get("/debug/env")
+def debug_env():
+    """Debug endpoint to check environment (doesn't reveal secrets)"""
+    return {
+        "OPENAI_API_KEY_SET": bool(os.getenv("OPENAI_API_KEY")),
+        "RAILWAY_ENVIRONMENT": os.getenv("RAILWAY_ENVIRONMENT_NAME", "not set"),
+        "RAILWAY_SERVICE": os.getenv("RAILWAY_SERVICE_NAME", "not set"),
+        "PWD": os.getcwd(),
+        "files_in_app": os.listdir("/app") if os.path.exists("/app") else "no /app dir"
+    }
 
 # ============================================================
-#  SERVE FRONTEND (Railway serves static files)
+#  SERVE FRONTEND (must be LAST - catches all other routes)
 # ============================================================
-app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+if FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
+else:
+    @app.get("/")
+    def no_frontend():
+        return {"error": f"Frontend not found at {FRONTEND_DIR}", "hint": "Check your folder structure"}
 
 print("Rules Assistant API ready!")
+print(f"  BASE_DIR: {BASE_DIR}")
+print(f"  DATA_DIR: {DATA_DIR}")
+print(f"  FRONTEND_DIR: {FRONTEND_DIR}")
+print(f"  OPENAI_API_KEY set: {bool(os.getenv('OPENAI_API_KEY'))}")
