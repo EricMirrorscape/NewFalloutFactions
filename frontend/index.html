@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fallout Factions – Rules Assistant</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div id="app">
+    <!-- AI-generated frame overlay -->
+    <div id="frame-overlay"></div>
+    
+    <!-- Main compact terminal -->
+    <div id="terminal-container">
+        
+        <!-- Header with avatar and title -->
+        <header id="terminal-header">
+            <img id="bot-avatar" src="assets/avatar.png" alt="Fallout Factions" />
+            <div id="header-text">
+                <h1 id="bot-name">Fallout Factions</h1>
+                <div id="subtitle">RULES ASSISTANT</div>
+            </div>
+        </header>
+        
+        <!-- Conversation area (scrollable) -->
+        <div id="conversation-area">
+            <div id="welcome-message">
+                <div class="bot-intro">
+                    <strong>Fallout Factions Rules Oracle</strong> online.
+                    <br>Ask me anything about the rules.
+                </div>
+            </div>
+        </div>
+        
+        <!-- Input area -->
+        <div id="input-area">
+            <textarea 
+                id="user-input" 
+                placeholder="Ask a rules question..."
+                rows="2"
+            ></textarea>
+            <button id="send-btn" type="button">SEND</button>
+        </div>
+        
+    </div>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>

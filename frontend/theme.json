@@ -1,0 +1,16 @@
+{
+  "theme_key": "post_apocalyptic",
+  "theme_name": "Post-Apocalyptic Terminal",
+  "description": "Fallout-style green CRT terminal UI.",
+  "colors": {
+    "primary": "#00ff41",
+    "secondary": "#003311",
+    "accent": "#7dfb00",
+    "background": "#000000",
+    "text": "#00ff41"
+  },
+  "fonts": {
+    "primary": "'VT323', 'Courier New', monospace",
+    "secondary": "'Share Tech Mono', monospace"
+  }
+}
